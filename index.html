@@ -112,6 +112,7 @@ input,select{width:100%;border:1px solid #cfd8e8;border-radius:8px;padding:9px;b
         <label class="inline"><input type="radio" name="liveMode" value="image">Somente imagem</label>
         <label class="inline"><input type="radio" name="liveMode" value="arduino" checked>Imagem + Arduino Due</label>
         <div class="row" style="margin-top:14px"><button id="startLive" class="btn good" style="flex:1">▶ START</button><button id="stopLive" class="btn stop" style="flex:1">■ STOP</button></div>
+        <div id="sampleChangeRow" class="row" style="margin-top:8px;display:none"><button id="sampleChangeBtn" class="btn" style="flex:1">Trocar amostra</button></div>
         <h3>Log</h3><div id="serialLog" class="log"></div><div class="row" style="margin-top:8px"><button id="clearLog" class="btn secondary">Limpar log</button></div>
       </div>
     </div>
@@ -246,29 +247,29 @@ async function connectCamera(){
 
     let cams=await listCameras();
 
-    // Obtém permissão para o navegador revelar o nome das fontes.
+    // Se os nomes das câmeras ainda não estiverem disponíveis,
+    // pede acesso primeiro e lista novamente.
     if(!cams.length || cams.every(c=>!c.label)){
       const p=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
       p.getTracks().forEach(t=>t.stop());
       cams=await listCameras();
     }
 
-    if(!cams.length) throw new Error('Nenhuma câmera disponível.');
+    if(!cams.length)throw new Error('Nenhuma câmera disponível.');
 
-    // O navegador deve usar a câmera VIRTUAL do DroidCam Client.
-    // Não priorizar diretamente "SM-A165M [USB]", que é a fonte física do telefone.
-    let chosen=cams.find(c=>/droidcam/i.test(c.label||''));
+    let id=$('cameraSelect').value||cams[0]?.deviceId;
 
-    // Se o Windows/browser não chamar a fonte de "DroidCam", pergunta qual usar
-    // sem adicionar qualquer elemento novo à interface.
-    if(!chosen){
+    // Mesmo comportamento do software anterior:
+    // o usuário escolhe explicitamente a fonte de vídeo.
+    if(cams.length>1){
       const menu=cams.map((c,i)=>`${i+1}. ${c.label||'Câmera '+(i+1)}`).join('\n');
-      const ans=prompt(`Selecione a fonte de vídeo do DroidCam:\n${menu}`, '1');
+      const ans=prompt(`Selecione a fonte de vídeo:\n${menu}`,'1');
       const idx=clamp((Number(ans)||1)-1,0,cams.length-1);
-      chosen=cams[idx];
+      id=cams[idx].deviceId;
+      $('cameraSelect').value=id;
     }
 
-    $('cameraSelect').value=chosen.deviceId;
+    const chosen=cams.find(c=>c.deviceId===id)||cams[0];
 
     stream=await navigator.mediaDevices.getUserMedia({
       video:{deviceId:{exact:chosen.deviceId}},
@@ -282,8 +283,7 @@ async function connectCamera(){
     centerRoi($('liveVideo'),liveRoi);
     drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
 
-    const track=stream.getVideoTracks()[0];
-    const nome=track?.label||chosen.label||'fonte de vídeo';
+    const nome=stream.getVideoTracks()[0]?.label||chosen.label||'fonte de vídeo';
     log('Câmera conectada: '+nome);
   }catch(e){
     setConnection('camera',false);
@@ -356,6 +356,12 @@ function handleSerialLine(line){
   log(line);
   if(/PONG|ARDUINO_READY|Arduino pronto/i.test(line)){
     arduinoReady=true;
+  }
+  if(/AGUARDANDO_TROCA_AMOSTRA|Troca Amostra - aguardando/i.test(line)){
+    $('sampleChangeRow').style.display='flex';
+  }
+  if(/TROCAR recebido|TROCA_AMOSTRA_FINALIZADA|Troca de amostra concluida|Troca de amostra ignorada/i.test(line)){
+    $('sampleChangeRow').style.display='none';
   }
   let m=line.match(/Replicata\s*=\s*(\d+)/i);
   if(m&&liveActive){
@@ -528,8 +534,21 @@ async function stopLiveAcquisition(auto=false,createRecord=true){
   }
 }
 function incrementRunName(){const s=$('runName').value,m=s.match(/^(.*?)(\d+)$/);$('runName').value=m?m[1]+String(Number(m[2])+1).padStart(m[2].length,'0'):`Corrida ${String(recordId).padStart(3,'0')}`}
+$('sampleChangeBtn').onclick=async()=>{
+  if(!serialPort){
+    log('Comando TROCAR não enviado: Arduino não conectado.');
+    return;
+  }
+  try{
+    await sendSerial('TROCAR');
+    log('Comando TROCAR transmitido ao Arduino.');
+  }catch(e){
+    log('Falha ao enviar TROCAR: '+e.message);
+  }
+};
 $('startLive').onclick=startLiveAcquisition;
 $('stopLive').onclick=async()=>{
+  $('sampleChangeRow').style.display='none';
   if(mode()==='arduino' && serialPort){
     try{await sendSerial('STOP')}catch(e){log('Não foi possível enviar STOP ao Arduino: '+e.message)}
   }
