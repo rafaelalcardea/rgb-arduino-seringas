@@ -243,17 +243,53 @@ async function listCameras(){
 async function connectCamera(){
   try{
     if(stream)stream.getTracks().forEach(t=>t.stop());
+
     let cams=await listCameras();
-    if(!cams.length){const p=await navigator.mediaDevices.getUserMedia({video:true,audio:false});p.getTracks().forEach(t=>t.stop());cams=await listCameras()}
-    let id=$('cameraSelect').value||cams[0]?.deviceId;
-    if(cams.length>1){
-      const menu=cams.map((c,i)=>`${i+1}. ${c.label||'Câmera '+(i+1)}`).join('\n');
-      const ans=prompt(`Selecione a fonte de vídeo:\n${menu}`, '1');
-      const idx=clamp((Number(ans)||1)-1,0,cams.length-1); id=cams[idx].deviceId; $('cameraSelect').value=id;
+
+    // Primeiro obtém permissão para revelar os nomes reais das fontes.
+    if(!cams.length || cams.every(c=>!c.label)){
+      const p=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+      p.getTracks().forEach(t=>t.stop());
+      cams=await listCameras();
     }
-    stream=await navigator.mediaDevices.getUserMedia({video:id?{deviceId:{exact:id}}:true,audio:false});
-    $('liveVideo').srcObject=stream;await $('liveVideo').play();setConnection('camera',true);centerRoi($('liveVideo'),liveRoi);drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);log('Câmera conectada.');
-  }catch(e){setConnection('camera',false);log('Falha ao conectar câmera: '+e.message)}
+
+    if(!cams.length) throw new Error('Nenhuma câmera disponível.');
+
+    // Sem alterar a interface: prioriza automaticamente DroidCam / Galaxy A16.
+    let chosen=cams.find(c=>/droidcam|sm-a165|galaxy\s*a16/i.test(c.label||''));
+
+    // Se não reconhecer o DroidCam pelo nome, mantém o comportamento anterior.
+    if(!chosen){
+      let id=$('cameraSelect').value||cams[0]?.deviceId;
+      if(cams.length>1){
+        const menu=cams.map((c,i)=>`${i+1}. ${c.label||'Câmera '+(i+1)}`).join('\n');
+        const ans=prompt(`Selecione a fonte de vídeo:\n${menu}`, '1');
+        const idx=clamp((Number(ans)||1)-1,0,cams.length-1);
+        id=cams[idx].deviceId;
+      }
+      chosen=cams.find(c=>c.deviceId===id)||cams[0];
+    }
+
+    $('cameraSelect').value=chosen.deviceId;
+
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{deviceId:{exact:chosen.deviceId}},
+      audio:false
+    });
+
+    $('liveVideo').srcObject=stream;
+    await $('liveVideo').play();
+
+    setConnection('camera',true);
+    centerRoi($('liveVideo'),liveRoi);
+    drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+
+    const nome=stream.getVideoTracks()[0]?.label||chosen.label||'fonte de vídeo';
+    log('Câmera conectada: '+nome);
+  }catch(e){
+    setConnection('camera',false);
+    log('Falha ao conectar câmera: '+e.message);
+  }
 }
 $('cameraConn').onclick=connectCamera;
 
