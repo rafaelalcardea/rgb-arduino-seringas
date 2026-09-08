@@ -205,7 +205,7 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const waitEvent=(el,name)=>new Promise((resolve,reject)=>{const ok=()=>{cleanup();resolve()},bad=()=>{cleanup();reject(new Error('Falha ao carregar mídia'))},cleanup=()=>{el.removeEventListener(name,ok);el.removeEventListener('error',bad)};el.addEventListener(name,ok,{once:true});el.addEventListener('error',bad,{once:true})});
 
 let stream=null, recorder=null, chunks=[], currentVideoBlob=null;
-let serialPort=null, serialReader=null, serialRunning=false, serialBuffer='', currentSerialRep=null, serialRepWindows=[];
+let serialPort=null, serialReader=null, serialRunning=false, serialBuffer='', currentSerialRep=null, serialRepWindows=[], arduinoReady=false;
 let liveTimer=null, liveStartPerf=0, liveData=[], liveActive=false;
 let liveRoi={x:0,y:0,locked:false,valid:false}, reRoi={x:0,y:0,locked:false,valid:false};
 let videoFiles=[], videoUrls=[], selectedVideoIndex=-1, reData=[];
@@ -246,7 +246,7 @@ async function connectCamera(){
 
     let cams=await listCameras();
 
-    // Primeiro obtém permissão para revelar os nomes reais das fontes.
+    // Obtém permissão para o navegador revelar o nome das fontes.
     if(!cams.length || cams.every(c=>!c.label)){
       const p=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
       p.getTracks().forEach(t=>t.stop());
@@ -255,19 +255,17 @@ async function connectCamera(){
 
     if(!cams.length) throw new Error('Nenhuma câmera disponível.');
 
-    // Sem alterar a interface: prioriza automaticamente DroidCam / Galaxy A16.
-    let chosen=cams.find(c=>/droidcam|sm-a165|galaxy\s*a16/i.test(c.label||''));
+    // O navegador deve usar a câmera VIRTUAL do DroidCam Client.
+    // Não priorizar diretamente "SM-A165M [USB]", que é a fonte física do telefone.
+    let chosen=cams.find(c=>/droidcam/i.test(c.label||''));
 
-    // Se não reconhecer o DroidCam pelo nome, mantém o comportamento anterior.
+    // Se o Windows/browser não chamar a fonte de "DroidCam", pergunta qual usar
+    // sem adicionar qualquer elemento novo à interface.
     if(!chosen){
-      let id=$('cameraSelect').value||cams[0]?.deviceId;
-      if(cams.length>1){
-        const menu=cams.map((c,i)=>`${i+1}. ${c.label||'Câmera '+(i+1)}`).join('\n');
-        const ans=prompt(`Selecione a fonte de vídeo:\n${menu}`, '1');
-        const idx=clamp((Number(ans)||1)-1,0,cams.length-1);
-        id=cams[idx].deviceId;
-      }
-      chosen=cams.find(c=>c.deviceId===id)||cams[0];
+      const menu=cams.map((c,i)=>`${i+1}. ${c.label||'Câmera '+(i+1)}`).join('\n');
+      const ans=prompt(`Selecione a fonte de vídeo do DroidCam:\n${menu}`, '1');
+      const idx=clamp((Number(ans)||1)-1,0,cams.length-1);
+      chosen=cams[idx];
     }
 
     $('cameraSelect').value=chosen.deviceId;
@@ -284,7 +282,8 @@ async function connectCamera(){
     centerRoi($('liveVideo'),liveRoi);
     drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
 
-    const nome=stream.getVideoTracks()[0]?.label||chosen.label||'fonte de vídeo';
+    const track=stream.getVideoTracks()[0];
+    const nome=track?.label||chosen.label||'fonte de vídeo';
     log('Câmera conectada: '+nome);
   }catch(e){
     setConnection('camera',false);
@@ -296,15 +295,41 @@ $('cameraConn').onclick=connectCamera;
 async function connectArduino(){
   try{
     if(serialPort){await disconnectArduino();return}
-    if(!('serial' in navigator)){alert('Web Serial não é suportado neste navegador. Use Chrome/Edge em HTTPS.');return}
-    serialPort=await navigator.serial.requestPort();await serialPort.open({baudRate:9600});setConnection('arduino',true);serialRunning=true;readSerial();log('Arduino conectado.');
-  }catch(e){setConnection('arduino',false);log('Falha ao conectar Arduino: '+e.message);serialPort=null}
+    if(!('serial' in navigator)){
+      alert('Web Serial não é suportado neste navegador. Use Chrome/Edge em HTTPS.');
+      return;
+    }
+
+    serialPort=await navigator.serial.requestPort();
+    await serialPort.open({baudRate:9600});
+
+    arduinoReady=false;
+    setConnection('arduino',true);
+    serialRunning=true;
+    readSerial();
+    log('Arduino conectado. Aguardando inicialização...');
+
+    // Ao abrir uma porta serial o Due pode reiniciar.
+    await sleep(1800);
+
+    try{
+      await sendSerial('PING');
+      log('Teste de comunicação enviado (PING).');
+    }catch(e){
+      log('Falha no teste de comunicação: '+e.message);
+    }
+  }catch(e){
+    setConnection('arduino',false);
+    log('Falha ao conectar Arduino: '+e.message);
+    serialPort=null;
+    arduinoReady=false;
+  }
 }
 async function disconnectArduino(){
   serialRunning=false;
   try{if(serialReader){await serialReader.cancel();serialReader.releaseLock();serialReader=null}}catch(e){}
   try{if(serialPort)await serialPort.close()}catch(e){}
-  serialPort=null;setConnection('arduino',false);log('Arduino desconectado.')
+  serialPort=null;arduinoReady=false;setConnection('arduino',false);log('Arduino desconectado.')
 }
 $('arduinoConn').onclick=connectArduino;
 $('clearLog').onclick=()=>{$('serialLog').textContent=''};
@@ -329,6 +354,9 @@ async function readSerial(){
 }
 function handleSerialLine(line){
   log(line);
+  if(/PONG|ARDUINO_READY|Arduino pronto/i.test(line)){
+    arduinoReady=true;
+  }
   let m=line.match(/Replicata\s*=\s*(\d+)/i);
   if(m&&liveActive){
     const rep=Number(m[1]),t=(performance.now()-liveStartPerf)/1000;
@@ -424,14 +452,69 @@ async function stopRecorder(){
   return await new Promise(resolve=>{const done=()=>setTimeout(()=>resolve(currentVideoBlob),0);recorder.addEventListener('stop',done,{once:true});try{recorder.stop()}catch(e){resolve(currentVideoBlob)}});
 }
 async function startLiveAcquisition(){
-  if(liveActive)return;if(!stream){await connectCamera();if(!stream)return}
-  if(!liveRoi.valid){centerRoi($('liveVideo'),liveRoi);drawRoi($('liveVideo'),$('liveOverlay'),liveRoi)}
-  const channels=channelsFrom('liveChannels');if(!channels.length){alert('Selecione pelo menos um canal.');return}
-  liveData=[];serialRepWindows=[];currentSerialRep=null;liveActive=true;liveStartPerf=performance.now();$('liveProgress').textContent='Aquisição em andamento';await startRecorder();
+  if(liveActive)return;
+
+  log('Botão START acionado.');
+
+  if(mode()==='arduino' && !serialPort){
+    log('START não enviado: Arduino não conectado.');
+    return;
+  }
+
+  if(!stream){
+    await connectCamera();
+    if(!stream){
+      log('Aquisição não iniciada: câmera indisponível.');
+      return;
+    }
+  }
+
+  if(!liveRoi.valid){
+    centerRoi($('liveVideo'),liveRoi);
+    drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+  }
+
+  const channels=channelsFrom('liveChannels');
+  if(!channels.length){
+    alert('Selecione pelo menos um canal.');
+    return;
+  }
+
+  liveData=[];
+  serialRepWindows=[];
+  currentSerialRep=null;
+  liveActive=true;
+  liveStartPerf=performance.now();
+  $('liveProgress').textContent='Aquisição em andamento';
+
+  await startRecorder();
+
   const dt=Math.max(.01,Number($('liveFrameInterval').value)||.1);
-  const tick=()=>{if(!liveActive)return;const v=meanRoi($('liveVideo'),liveRoi,roiDiameterFor('live'),channels);if(v){v.t=(performance.now()-liveStartPerf)/1000;liveData.push(v);drawTemporal('liveChart',liveData,channels)}};
-  tick();liveTimer=setInterval(tick,dt*1000);
-  if(mode()==='arduino'){if(!serialPort){log('Arduino não conectado. Conecte-o ou use o modo Somente imagem.');stopLiveAcquisition(false,false);return}await sleep(150);try{await sendSerial('START')}catch(e){log(e.message);stopLiveAcquisition(false,false)}}
+  const tick=()=>{
+    if(!liveActive)return;
+    const v=meanRoi($('liveVideo'),liveRoi,roiDiameterFor('live'),channels);
+    if(v){
+      v.t=(performance.now()-liveStartPerf)/1000;
+      liveData.push(v);
+      drawTemporal('liveChart',liveData,channels);
+    }
+  };
+
+  tick();
+  liveTimer=setInterval(tick,dt*1000);
+
+  if(mode()==='arduino'){
+    if(!arduinoReady){
+      log('Aviso: confirmação PONG/READY ainda não recebida; enviando START mesmo assim.');
+    }
+    try{
+      await sendSerial('START');
+      log('Comando START transmitido ao Arduino.');
+    }catch(e){
+      log('Falha ao enviar START: '+e.message);
+      await stopLiveAcquisition(false,false);
+    }
+  }
 }
 async function stopLiveAcquisition(auto=false,createRecord=true){
   if(!liveActive)return;liveActive=false;if(liveTimer){clearInterval(liveTimer);liveTimer=null}
