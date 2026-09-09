@@ -209,6 +209,9 @@ let stream=null, recorder=null, chunks=[], currentVideoBlob=null;
 let serialPort=null, serialReader=null, serialRunning=false, serialBuffer='', currentSerialRep=null, serialRepWindows=[], arduinoReady=false;
 let liveTimer=null, liveStartPerf=0, liveData=[], liveActive=false;
 let liveRoi={x:0,y:0,locked:false,valid:false}, reRoi={x:0,y:0,locked:false,valid:false};
+let liveAutoRoiEnabled=false, liveAutoBaseline=null, liveAutoBestScore=-Infinity, liveAutoLastScan=0, liveAutoFound=false;
+let reAutoRoiEnabled=false, reAutoBest=null;
+const AUTO_ROI_MIN_DELTA=1.5;
 let videoFiles=[], videoUrls=[], selectedVideoIndex=-1, reData=[];
 let records=[], recordId=1, selectedRecordId=null, resultChannel='g';
 let exportSelected=new Set();
@@ -405,22 +408,254 @@ function meanRoi(video,roi,diameter,selected){
   for(let yy=0;yy<y1-y0;yy++)for(let xx=0;xx<ww;xx++){const dx=x0+xx-roi.x,dy=y0+yy-roi.y;if(dx*dx+dy*dy>rad*rad)continue;const i=(yy*ww+xx)*4;sr+=img[i];sg+=img[i+1];sb+=img[i+2];n++}
   if(!n)return null;return{r:selected.includes('r')?sr/n:NaN,g:selected.includes('g')?sg/n:NaN,b:selected.includes('b')?sb/n:NaN,pixels:n}
 }
-async function autoRoi(video,roi,diameter,canvas){
-  if(!video.videoWidth){alert('A fonte de vídeo ainda não está pronta.');return}
-  const maxW=360,scale=Math.min(1,maxW/video.videoWidth),w=Math.max(80,Math.round(video.videoWidth*scale)),h=Math.max(60,Math.round(video.videoHeight*scale));
-  const c=document.createElement('canvas');c.width=w;c.height=h;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(video,0,0,w,h);const data=ctx.getImageData(0,0,w,h).data;
-  const rad=Math.max(2,diameter*scale/2),step=Math.max(2,Math.round(rad/2));let best=-Infinity,bx=w/2,by=h/2;
-  for(let y=Math.ceil(rad);y<h-rad;y+=step)for(let x=Math.ceil(rad);x<w-rad;x+=step){let s=0,n=0;for(let yy=-rad;yy<=rad;yy+=2)for(let xx=-rad;xx<=rad;xx+=2){if(xx*xx+yy*yy>rad*rad)continue;const px=Math.round(x+xx),py=Math.round(y+yy),i=(py*w+px)*4;s+=data[i]+data[i+1]+data[i+2];n++}const score=n?s/n:0;if(score>best){best=score;bx=x;by=y}}
-  roi.x=bx/scale;roi.y=by/scale;roi.valid=true;roi.locked=true;drawRoi(video,canvas,roi)
+
+async function captureAutoBaseline(video,frames=5){
+  if(!video.videoWidth||!video.videoHeight)return null;
+  const maxW=320,scale=Math.min(1,maxW/video.videoWidth);
+  const w=Math.max(80,Math.round(video.videoWidth*scale));
+  const h=Math.max(60,Math.round(video.videoHeight*scale));
+  const c=document.createElement('canvas');c.width=w;c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  const acc=new Float32Array(w*h*3);
+
+  for(let f=0;f<frames;f++){
+    ctx.drawImage(video,0,0,w,h);
+    const d=ctx.getImageData(0,0,w,h).data;
+    for(let i=0,j=0;i<d.length;i+=4){
+      acc[j++]+=d[i];
+      acc[j++]+=d[i+1];
+      acc[j++]+=d[i+2];
+    }
+    if(f<frames-1)await sleep(60);
+  }
+
+  for(let i=0;i<acc.length;i++)acc[i]/=frames;
+  return {w,h,scale,data:acc};
 }
-$('liveRoiManual').onclick=()=>{liveRoi.locked=false;if(!liveRoi.valid)centerRoi($('liveVideo'),liveRoi);drawRoi($('liveVideo'),$('liveOverlay'),liveRoi)};
-$('liveRoiAuto').onclick=()=>autoRoi($('liveVideo'),liveRoi,roiDiameterFor('live'),$('liveOverlay'));
-$('liveRoiLock').onclick=()=>{liveRoi.locked=true;drawRoi($('liveVideo'),$('liveOverlay'),liveRoi)};
-$('liveRoiClear').onclick=()=>clearRoi(liveRoi,$('liveOverlay'));
-$('reRoiManual').onclick=()=>{reRoi.locked=false;if(!reRoi.valid)centerRoi($('reVideo'),reRoi);drawRoi($('reVideo'),$('reOverlay'),reRoi)};
-$('reRoiAuto').onclick=()=>autoRoi($('reVideo'),reRoi,roiDiameterFor('re'),$('reOverlay'));
-$('reRoiLock').onclick=()=>{reRoi.locked=true;drawRoi($('reVideo'),$('reOverlay'),reRoi)};
-$('reRoiClear').onclick=()=>clearRoi(reRoi,$('reOverlay'));
+
+function findAutoRoiDelta(video,diameter,baseline){
+  if(!baseline||!video.videoWidth)return null;
+
+  const {w,h,scale,data:base}=baseline;
+  const c=document.createElement('canvas');c.width=w;c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(video,0,0,w,h);
+  const cur=ctx.getImageData(0,0,w,h).data;
+
+  const rad=Math.max(2,diameter*scale/2);
+  const step=Math.max(2,Math.round(rad/2));
+  let best=-Infinity,bx=w/2,by=h/2;
+
+  for(let y=Math.ceil(rad);y<h-rad;y+=step){
+    for(let x=Math.ceil(rad);x<w-rad;x+=step){
+      let sum=0,n=0;
+
+      for(let yy=-rad;yy<=rad;yy+=1){
+        for(let xx=-rad;xx<=rad;xx+=1){
+          if(xx*xx+yy*yy>rad*rad)continue;
+
+          const px=Math.round(x+xx),py=Math.round(y+yy);
+          const p=py*w+px,ci=p*4,bi=p*3;
+
+          const br=base[bi],bg=base[bi+1],bb=base[bi+2];
+          const bmean=(br+bg+bb)/3;
+
+          // Mesmo cálculo de Δ do software antigo:
+          // considera apenas aumentos de R, G e B em relação ao fundo.
+          const delta=(
+            Math.max(0,cur[ci]-br)+
+            Math.max(0,cur[ci+1]-bg)+
+            Math.max(0,cur[ci+2]-bb)
+          )/3;
+
+          // Mesmo tratamento do software antigo:
+          // regiões já claras no fundo (texto/watermark/reflexos)
+          // recebem peso muito menor.
+          const weight=Math.max(0.05,1-bmean/255);
+
+          sum+=delta*weight;
+          n++;
+        }
+      }
+
+      const score=n?sum/n:0;
+      if(score>best){
+        best=score;
+        bx=x;
+        by=y;
+      }
+    }
+  }
+
+  return {x:bx/scale,y:by/scale,score:best};
+}
+
+function setLiveAutoRoi(enabled){
+  liveAutoRoiEnabled=enabled;
+  liveAutoBaseline=null;
+  liveAutoBestScore=-Infinity;
+  liveAutoLastScan=0;
+  liveAutoFound=false;
+
+  $('liveRoiAuto').classList.toggle('roiActive',enabled);
+
+  if(enabled){
+    liveRoi.locked=false;
+    if(!liveRoi.valid)centerRoi($('liveVideo'),liveRoi);
+    drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+    $('liveProgress').textContent='ROI automática preparada. O fundo será registrado ao clicar START.';
+    log('ROI automática preparada — aguardando START.');
+  }else{
+    $('liveProgress').textContent='ROI manual selecionada.';
+  }
+}
+
+function applyLiveAutoCandidate(){
+  if(!liveAutoRoiEnabled||liveRoi.locked||!liveAutoBaseline||!$('liveVideo').videoWidth)return false;
+
+  const p=findAutoRoiDelta($('liveVideo'),roiDiameterFor('live'),liveAutoBaseline);
+
+  // Igual ao software antigo: pequenas oscilações não reposicionam a ROI.
+  if(!p||p.score<AUTO_ROI_MIN_DELTA)return false;
+
+  if(p.score>liveAutoBestScore){
+    liveAutoBestScore=p.score;
+    liveRoi.x=p.x;
+    liveRoi.y=p.y;
+    liveRoi.valid=true;
+    liveAutoFound=true;
+    drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+    return true;
+  }
+
+  return false;
+}
+
+async function findBestRoiInVideo(video,diameter){
+  if(!video.videoWidth||!finite(video.duration)||video.duration<=0){
+    throw new Error('O vídeo ainda não está pronto para a seleção automática da ROI.');
+  }
+
+  const dur=video.duration;
+  video.pause();
+
+  // Fundo obtido no início do vídeo.
+  const baselineTimes=[0,Math.min(.10,dur),Math.min(.20,dur),Math.min(.30,dur),Math.min(.40,dur)];
+  const maxW=320,scale=Math.min(1,maxW/video.videoWidth);
+  const w=Math.max(80,Math.round(video.videoWidth*scale));
+  const h=Math.max(60,Math.round(video.videoHeight*scale));
+  const c=document.createElement('canvas');c.width=w;c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  const acc=new Float32Array(w*h*3);
+
+  $('reProgress').textContent='ROI automática: registrando o fundo do vídeo...';
+
+  for(const t of baselineTimes){
+    await seekVideo(video,t);
+    ctx.drawImage(video,0,0,w,h);
+    const d=ctx.getImageData(0,0,w,h).data;
+    for(let i=0,j=0;i<d.length;i+=4){
+      acc[j++]+=d[i];
+      acc[j++]+=d[i+1];
+      acc[j++]+=d[i+2];
+    }
+  }
+
+  for(let i=0;i<acc.length;i++)acc[i]/=baselineTimes.length;
+  const baseline={w,h,scale,data:acc};
+
+  // Analisa no máximo ~250 instantes ao longo de todo o vídeo.
+  const requestedDt=Math.max(.05,Number($('reFrameInterval').value)||.10);
+  const scanDt=Math.max(requestedDt,dur/250);
+
+  let best={score:-Infinity,x:video.videoWidth/2,y:video.videoHeight/2,t:0};
+  let count=0,total=Math.max(1,Math.ceil(dur/scanDt)+1);
+
+  for(let t=0;t<=dur+1e-8;t+=scanDt){
+    await seekVideo(video,Math.min(t,dur));
+    const p=findAutoRoiDelta(video,diameter,baseline);
+    if(p&&p.score>best.score){
+      best={...p,t:Math.min(t,dur)};
+    }
+    count++;
+    if(count%5===0||count===total){
+      $('reProgress').textContent=`ROI automática: analisando o vídeo ${Math.min(100,Math.round(100*count/total))}%`;
+    }
+  }
+
+  if(!finite(best.score)||best.score<AUTO_ROI_MIN_DELTA){
+    throw new Error('Não foi detectado aumento de emissão suficiente para posicionar a ROI automaticamente.');
+  }
+
+  return best;
+}
+
+$('liveRoiManual').onclick=()=>{
+  setLiveAutoRoi(false);
+  liveRoi.locked=false;
+  if(!liveRoi.valid)centerRoi($('liveVideo'),liveRoi);
+  drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+};
+
+$('liveRoiAuto').onclick=()=>setLiveAutoRoi(true);
+
+$('liveRoiLock').onclick=()=>{
+  if(!liveRoi.valid){
+    alert('Defina primeiro a posição da ROI.');
+    return;
+  }
+  liveRoi.locked=true;
+  liveAutoRoiEnabled=false;
+  $('liveRoiAuto').classList.remove('roiActive');
+  $('liveProgress').textContent='ROI travada.';
+  drawRoi($('liveVideo'),$('liveOverlay'),liveRoi);
+};
+
+$('liveRoiClear').onclick=()=>{
+  setLiveAutoRoi(false);
+  clearRoi(liveRoi,$('liveOverlay'));
+  $('liveProgress').textContent='ROI removida.';
+};
+
+$('reRoiManual').onclick=()=>{
+  reAutoRoiEnabled=false;
+  reAutoBest=null;
+  reRoi.locked=false;
+  $('reRoiAuto').classList.remove('roiActive');
+  if(!reRoi.valid)centerRoi($('reVideo'),reRoi);
+  drawRoi($('reVideo'),$('reOverlay'),reRoi);
+  $('reProgress').textContent='ROI manual selecionada.';
+};
+
+$('reRoiAuto').onclick=()=>{
+  reAutoRoiEnabled=true;
+  reAutoBest=null;
+  reRoi.locked=false;
+  $('reRoiAuto').classList.add('roiActive');
+  if(!reRoi.valid)centerRoi($('reVideo'),reRoi);
+  drawRoi($('reVideo'),$('reOverlay'),reRoi);
+  $('reProgress').textContent='ROI automática preparada. Clique em “Executar reprocessamento” para procurar a maior emissão do vídeo.';
+};
+
+$('reRoiLock').onclick=()=>{
+  if(!reRoi.valid){
+    alert('Defina primeiro a posição da ROI.');
+    return;
+  }
+  reRoi.locked=true;
+  reAutoRoiEnabled=false;
+  $('reRoiAuto').classList.remove('roiActive');
+  $('reProgress').textContent='ROI travada.';
+  drawRoi($('reVideo'),$('reOverlay'),reRoi);
+};
+
+$('reRoiClear').onclick=()=>{
+  reAutoRoiEnabled=false;
+  reAutoBest=null;
+  clearRoi(reRoi,$('reOverlay'));
+  $('reRoiAuto').classList.remove('roiActive');
+  $('reProgress').textContent='ROI removida.';
+};
 
 function drawTemporal(canvasId,data,channels){
   const c=$(canvasId),rect=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,Math.round(rect.width||600)),h=Math.max(220,Math.round(rect.height||360));c.width=w*dpr;c.height=h*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);x.fillStyle='#fff';x.fillRect(0,0,w,h);
@@ -489,15 +724,44 @@ async function startLiveAcquisition(){
   liveData=[];
   serialRepWindows=[];
   currentSerialRep=null;
+
+  // A ROI automática registra o fundo ANTES de iniciar a química.
+  if(liveAutoRoiEnabled&&!liveRoi.locked){
+    $('liveProgress').textContent='ROI automática: registrando o fundo...';
+    liveAutoBaseline=await captureAutoBaseline($('liveVideo'),5);
+
+    if(!liveAutoBaseline){
+      log('Não foi possível registrar o fundo para a ROI automática.');
+      return;
+    }
+
+    liveAutoBestScore=-Infinity;
+    liveAutoLastScan=0;
+    liveAutoFound=false;
+    log('ROI automática: fundo registrado.');
+  }
+
   liveActive=true;
   liveStartPerf=performance.now();
-  $('liveProgress').textContent='Aquisição em andamento';
+  $('liveProgress').textContent=liveAutoRoiEnabled&&!liveRoi.locked
+    ?'Aquisição em andamento — procurando a região com maior aumento de emissão...'
+    :'Aquisição em andamento';
 
   await startRecorder();
 
   const dt=Math.max(.01,Number($('liveFrameInterval').value)||.1);
   const tick=()=>{
     if(!liveActive)return;
+
+    const now=performance.now();
+
+    if(liveAutoRoiEnabled&&!liveRoi.locked&&now-liveAutoLastScan>=150){
+      liveAutoLastScan=now;
+      if(applyLiveAutoCandidate()){
+      $('liveProgress').textContent=`ROI automática ativa — maior ΔRGB válido: ${liveAutoBestScore.toFixed(2)}.`;
+    }
+    }
+
     const v=meanRoi($('liveVideo'),liveRoi,roiDiameterFor('live'),channels);
     if(v){
       v.t=(performance.now()-liveStartPerf)/1000;
@@ -525,7 +789,18 @@ async function startLiveAcquisition(){
 async function stopLiveAcquisition(auto=false,createRecord=true){
   if(!liveActive)return;liveActive=false;if(liveTimer){clearInterval(liveTimer);liveTimer=null}
   const stoppedVideoBlob=await stopRecorder();
-  $('liveProgress').textContent=auto?'Sequência finalizada automaticamente':'Aquisição interrompida';
+
+  if(liveAutoRoiEnabled&&!liveRoi.locked){
+    if(liveAutoFound){
+      $('liveProgress').textContent='Corrida finalizada — ROI mantida na região com maior aumento de emissão observado.';
+      log(`ROI automática finalizada. Melhor aumento relativo encontrado: ${liveAutoBestScore.toFixed(3)}.`);
+    }else{
+      $('liveProgress').textContent='Corrida finalizada — não foi detectado aumento de emissão suficiente para reposicionar a ROI.';
+      log('ROI automática: nenhuma região com aumento de emissão foi encontrada.');
+    }
+  }else{
+    $('liveProgress').textContent=auto?'Sequência finalizada automaticamente':'Aquisição interrompida';
+  }
   if(createRecord&&liveData.length){
     const channels=channelsFrom('liveChannels'),n=Math.max(1,Number($('liveReplicates').value)||5),gap=Math.max(0,Number($('livePeakGap').value)||5);
     const peaks=detectPeaks(liveData,n,gap,channels,serialRepWindows);
@@ -580,20 +855,95 @@ async function processFile(index,roiRel,diameter,channels,dt,nRep,gap){
   const peaks=detectPeaks(data,nRep,gap,channels);return{data,peaks,roi}
 }
 $('executeReprocess').onclick=async()=>{
-  if(!videoFiles.length){alert('Adicione um ou mais vídeos.');return}
-  if(!reRoi.valid){centerRoi($('reVideo'),reRoi)}
-  const v=$('reVideo');if(!v.videoWidth){await selectVideo(Math.max(0,selectedVideoIndex))}
-  const channels=channelsFrom('reChannels');if(!channels.length){alert('Selecione pelo menos um canal.');return}
-  const rel={nx:reRoi.x/(v.videoWidth||1),ny:reRoi.y/(v.videoHeight||1)},diameter=roiDiameterFor('re'),dt=Math.max(.01,Number($('reFrameInterval').value)||.1),nRep=Math.max(1,Number($('reReplicates').value)||5),gap=Math.max(0,Number($('rePeakGap').value)||5);
+  if(!videoFiles.length){
+    alert('Adicione um ou mais vídeos.');
+    return;
+  }
+
+  const v=$('reVideo');
+  if(!v.videoWidth){
+    await selectVideo(Math.max(0,selectedVideoIndex));
+  }
+
+  if(!reRoi.valid){
+    centerRoi(v,reRoi);
+  }
+
+  const channels=channelsFrom('reChannels');
+  if(!channels.length){
+    alert('Selecione pelo menos um canal.');
+    return;
+  }
+
+  const diameter=roiDiameterFor('re');
+  const dt=Math.max(.01,Number($('reFrameInterval').value)||.1);
+  const nRep=Math.max(1,Number($('reReplicates').value)||5);
+  const gap=Math.max(0,Number($('rePeakGap').value)||5);
+
   $('executeReprocess').disabled=true;
+
   try{
-    for(let i=0;i<videoFiles.length;i++){
-      const r=await processFile(i,rel,diameter,channels,dt,nRep,gap);reData=r.data;drawTemporal('reChart',reData,channels);
-      addRecord({name:videoFiles[i].name.replace(/\.[^.]+$/,''),source:'Reprocessamento',channels,interval:dt,gap,nRep,roi:{nx:rel.nx,ny:rel.ny,diameter},data:r.data,peaks:r.peaks,videoName:videoFiles[i].name});
+    if(reAutoRoiEnabled&&!reRoi.locked){
+      const best=await findBestRoiInVideo(v,diameter);
+      reAutoBest=best;
+      reRoi.x=best.x;
+      reRoi.y=best.y;
+      reRoi.valid=true;
+
+      await seekVideo(v,best.t);
+      drawRoi(v,$('reOverlay'),reRoi);
+
+      $('reProgress').textContent=`ROI automática encontrada em t = ${best.t.toFixed(2)} s. Reprocessando com essa posição...`;
+      log(`ROI automática do vídeo: t=${best.t.toFixed(2)} s; score=${best.score.toFixed(3)}.`);
     }
-    $('reProgress').textContent=`Concluído: ${videoFiles.length} vídeo(s) processado(s).`;
-  }catch(e){$('reProgress').textContent='Erro: '+e.message}
-  finally{$('executeReprocess').disabled=false;if(selectedVideoIndex>=0)selectVideo(selectedVideoIndex)}
+
+    const rel={
+      nx:reRoi.x/(v.videoWidth||1),
+      ny:reRoi.y/(v.videoHeight||1)
+    };
+
+    for(let i=0;i<videoFiles.length;i++){
+      const r=await processFile(i,rel,diameter,channels,dt,nRep,gap);
+      reData=r.data;
+      drawTemporal('reChart',reData,channels);
+
+      addRecord({
+        name:videoFiles[i].name.replace(/\.[^.]+$/,''),
+        source:'Reprocessamento',
+        channels,
+        interval:dt,
+        gap,
+        nRep,
+        roi:{nx:rel.nx,ny:rel.ny,diameter},
+        data:r.data,
+        peaks:r.peaks,
+        videoName:videoFiles[i].name
+      });
+    }
+
+    $('reProgress').textContent=`Concluído: ${videoFiles.length} vídeo(s) processado(s). ROI mantida na posição selecionada.`;
+
+  }catch(e){
+    $('reProgress').textContent='Erro: '+e.message;
+    log('Erro no reprocessamento: '+e.message);
+  }finally{
+    $('executeReprocess').disabled=false;
+
+    if(selectedVideoIndex>=0){
+      const idx=selectedVideoIndex;
+      const rel={
+        nx:reRoi.x/(v.videoWidth||1),
+        ny:reRoi.y/(v.videoHeight||1)
+      };
+
+      await selectVideo(idx);
+      const rv=$('reVideo');
+      reRoi.x=rel.nx*(rv.videoWidth||1);
+      reRoi.y=rel.ny*(rv.videoHeight||1);
+      reRoi.valid=true;
+      drawRoi(rv,$('reOverlay'),reRoi);
+    }
+  }
 };
 
 function addRecord(base){
@@ -644,7 +994,13 @@ function renderResults(){
     ].map(([k,v])=>`<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join(''):`<div class="note">${escapeHtml(rr.reg?.msg||'Não há calibração válida para este canal.')}</div>`;
     $('resultMsg').textContent=rr.ok?'Resultado calculado individualmente para cada replicata e resumido pela média, DP e CV.':'';
   }else if(rec.classification==='standard'){
-    const s=stat(peakSignals(rec,resultChannel));$('sampleMetrics').innerHTML=`<div class="metric"><div class="k">Sinal médio do padrão</div><div class="v">${fmt(s.mean,3)}</div></div>`;$('resultMsg').textContent='';
+    const s=stat(peakSignals(rec,resultChannel));
+    $('sampleMetrics').innerHTML=[
+      ['Sinal médio do padrão',fmt(s.mean,3)],
+      ['Desvio padrão (DP)',fmt(s.sd,3)],
+      ['CV',`${fmt(s.cv,2)} %`]
+    ].map(x=>`<div class="metric"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');
+    $('resultMsg').textContent='';
   }else{$('sampleMetrics').innerHTML='<div class="note">Classifique o registro como Padrão ou Amostra para utilizá-lo analiticamente.</div>';$('resultMsg').textContent=''}
 }
 document.querySelectorAll('#resultChannelTabs button').forEach(b=>b.onclick=()=>{resultChannel=b.dataset.ch;renderResults()});
