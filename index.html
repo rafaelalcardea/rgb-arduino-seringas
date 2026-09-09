@@ -44,6 +44,7 @@ input,select{width:100%;border:1px solid #cfd8e8;border-radius:8px;padding:9px;b
 .smallChart{height:280px}
 .log{height:280px;overflow:auto;border:1px solid #e4e8f0;border-radius:8px;background:#fbfcfe;padding:8px;font:12px Consolas,monospace;white-space:pre-wrap}
 .metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.metric{border:1px solid #e4e8f0;border-radius:9px;padding:10px;background:#fbfcfe}.metric .k{font-size:12px;color:var(--muted)}.metric .v{font-size:20px;font-weight:700;margin-top:5px}
+.replicateTitle{font-size:13px;font-weight:700;color:#344054;margin:14px 0 8px}.replicateGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px}.replicateBox{border:1px solid #d8e0ee;border-radius:9px;padding:9px;background:#fff}.replicateBox .repN{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase}.replicateBox .repSignal{font-size:18px;font-weight:700;margin-top:4px}.replicateBox .repExtra{font-size:11px;color:#475467;margin-top:4px;line-height:1.35}
 .tableWrap{overflow:auto;border:1px solid #e4e8f0;border-radius:9px;max-height:520px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eef1f6;text-align:left;white-space:nowrap}th{background:#f7f9fc;position:sticky;top:0;z-index:1}
 .recordRow.selected{background:#eef4ff}.classSel{min-width:135px;padding:6px}.trash{border:0;background:transparent;color:#475467;font-size:16px}.trash:hover{color:var(--red)}
 .videoList{max-height:390px;overflow:auto}.videoItem{display:flex;justify-content:space-between;align-items:center;padding:9px;border-bottom:1px solid #eef1f6}.videoItem.selected{background:#eef4ff}.videoItem button{border:0;background:transparent;color:#344054}
@@ -173,6 +174,8 @@ input,select{width:100%;border:1px solid #cfd8e8;border-radius:8px;padding:9px;b
         <h2>Resultado analítico</h2>
         <div id="selectedRecordInfo" class="note" style="margin-bottom:10px">Nenhum registro selecionado.</div>
         <div id="sampleMetrics" class="metrics"></div>
+        <div id="replicateTitle" class="replicateTitle hidden">Valores das replicatas</div>
+        <div id="replicateMetrics" class="replicateGrid"></div>
         <div id="standardPanel" class="stdPanel hidden">
           <h3>Dados do padrão selecionado</h3>
           <div class="field"><label>Concentração conhecida</label><input id="standardConcentration" type="number" step="any"></div>
@@ -659,11 +662,20 @@ $('reRoiClear').onclick=()=>{
 
 function drawTemporal(canvasId,data,channels){
   const c=$(canvasId),rect=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,Math.round(rect.width||600)),h=Math.max(220,Math.round(rect.height||360));c.width=w*dpr;c.height=h*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);x.fillStyle='#fff';x.fillRect(0,0,w,h);
-  const m={l:48,r:18,t:28,b:38};x.strokeStyle='#cdd5df';x.beginPath();x.moveTo(m.l,m.t);x.lineTo(m.l,h-m.b);x.lineTo(w-m.r,h-m.b);x.stroke();x.fillStyle='#475467';x.font='12px Arial';x.fillText('Sinal',7,17);x.fillText('Tempo (s)',w-70,h-10);
+  const m={l:52,r:18,t:28,b:38};
+  const ymin=0,ymax=255;
+  x.font='11px Arial';x.textAlign='right';x.textBaseline='middle';
+  [0,51,102,153,204,255].forEach(v=>{
+    const py=h-m.b-(v-ymin)/(ymax-ymin)*(h-m.t-m.b);
+    x.strokeStyle=v===0?'#cdd5df':'#edf0f4';x.lineWidth=1;x.beginPath();x.moveTo(m.l,py);x.lineTo(w-m.r,py);x.stroke();
+    x.fillStyle='#667085';x.fillText(String(v),m.l-7,py);
+  });
+  x.strokeStyle='#cdd5df';x.beginPath();x.moveTo(m.l,m.t);x.lineTo(m.l,h-m.b);x.lineTo(w-m.r,h-m.b);x.stroke();
+  x.fillStyle='#475467';x.font='12px Arial';x.textAlign='left';x.textBaseline='alphabetic';x.fillText('Sinal (0–255)',7,17);x.fillText('Tempo (s)',w-70,h-10);
   if(!data.length){x.fillStyle='#98a2b3';x.fillText('Sem dados',m.l+15,m.t+22);return}
-  const xs=data.map(d=>d.t).filter(finite),vals=[];channels.forEach(k=>data.forEach(d=>{if(finite(d[k]))vals.push(d[k])}));if(!xs.length||!vals.length)return;
-  let xmin=0,xmax=Math.max(...xs)||1,ymin=Math.min(...vals),ymax=Math.max(...vals);if(ymax===ymin)ymax=ymin+1;const pad=(ymax-ymin)*.08;ymin=Math.max(0,ymin-pad);ymax+=pad;
-  const X=t=>m.l+(t-xmin)/(xmax-xmin||1)*(w-m.l-m.r),Y=v=>h-m.b-(v-ymin)/(ymax-ymin)*(h-m.t-m.b);
+  const xs=data.map(d=>d.t).filter(finite);if(!xs.length||!channels.length)return;
+  const xmin=0,xmax=Math.max(...xs)||1;
+  const X=t=>m.l+(t-xmin)/(xmax-xmin||1)*(w-m.l-m.r),Y=v=>h-m.b-(clamp(v,ymin,ymax)-ymin)/(ymax-ymin)*(h-m.t-m.b);
   const colors={r:'#dc2626',g:'#16a34a',b:'#2563eb'};channels.forEach(k=>{x.strokeStyle=colors[k];x.lineWidth=1.7;x.beginPath();let start=true;data.forEach(d=>{if(!finite(d[k]))return;const px=X(d.t),py=Y(d[k]);if(start){x.moveTo(px,py);start=false}else x.lineTo(px,py)});x.stroke()});
   let lx=m.l+10;channels.forEach(k=>{x.fillStyle=colors[k];x.fillRect(lx,10,18,3);x.fillStyle='#344054';x.fillText(k.toUpperCase(),lx+24,15);lx+=55});
 }
@@ -978,9 +990,29 @@ function resultForSample(rec,ch){
   const reg=regression(ch),signals=peakSignals(rec,ch);if(!reg.ok||!signals.length||!reg.slope)return{ok:false,reg};
   const sig=stat(signals),concs=signals.map(y=>(y-reg.intercept)/reg.slope),cs=stat(concs);return{ok:true,reg,sig,cs,concs}
 }
+function renderReplicateMetrics(rec,ch,rr=null){
+  const title=$('replicateTitle'),box=$('replicateMetrics');
+  if(!rec){title.classList.add('hidden');box.innerHTML='';return}
+  const reg=rr?.ok?rr.reg:null;
+  const nExpected=Math.max(1,Number(rec.nRep)||rec.peaks?.length||1);
+  const rows=[];
+  for(let rep=1;rep<=nExpected;rep++){
+    const p=(rec.peaks||[]).find(pk=>Number(pk.rep)===rep)||(rec.peaks||[])[rep-1]||null;
+    const signal=p?.[ch],time=p?.['t'+ch];
+    const conc=finite(signal)&&reg&&reg.slope?(signal-reg.intercept)/reg.slope:NaN;
+    const extra=[];
+    if(finite(time))extra.push(`Pico em ${fmt(time,2)} s`);
+    if(finite(conc))extra.push(`${fmt(conc,6)} ${escapeHtml(reg.unit)}`);
+    if(!finite(signal))extra.push('Pico não detectado');
+    rows.push(`<div class="replicateBox"><div class="repN">Replicata ${rep}</div><div class="repSignal">${finite(signal)?fmt(signal,3):'—'}</div><div class="repExtra">${extra.join('<br>')}</div></div>`);
+  }
+  title.classList.remove('hidden');
+  title.textContent=`Valores das replicatas — canal ${ch.toUpperCase()}`;
+  box.innerHTML=rows.join('');
+}
 function renderResults(){
   if(!$('view-results').classList.contains('active'))return;
-  renderRecords();const rec=selectedRecord();if(!rec){drawTemporal('resultChart',[],[]);drawCalibration({ok:false});$('sampleMetrics').innerHTML='';$('calMetrics').innerHTML='';$('selectedRecordInfo').textContent='Nenhum registro selecionado.';$('standardPanel').classList.add('hidden');return}
+  renderRecords();const rec=selectedRecord();if(!rec){drawTemporal('resultChart',[],[]);drawCalibration({ok:false});$('sampleMetrics').innerHTML='';$('calMetrics').innerHTML='';$('replicateMetrics').innerHTML='';$('replicateTitle').classList.add('hidden');$('selectedRecordInfo').textContent='Nenhum registro selecionado.';$('standardPanel').classList.add('hidden');return}
   $('selectedRecordInfo').textContent=`${rec.name} — ${rec.source} — ${rec.classification==='standard'?'Padrão':rec.classification==='sample'?'Amostra':'Sem classificação'}`;
   document.querySelectorAll('#resultChannelTabs button').forEach(b=>b.classList.toggle('active',b.dataset.ch===resultChannel));
   drawTemporal('resultChart',rec.data,[resultChannel]);
@@ -989,19 +1021,40 @@ function renderResults(){
   ].map(([k,v])=>`<div class="metric"><div class="k">${k}</div><div class="v" style="font-size:${k==='Equação'?'13px':'17px'}">${v}</div></div>`).join(''):`<div class="note">${escapeHtml(reg.msg||'Curva não disponível.')}</div>`;
   $('standardPanel').classList.toggle('hidden',rec.classification!=='standard');if(rec.classification==='standard'){$('standardConcentration').value=finite(rec.concentration)?rec.concentration:'';$('standardUnit').value=rec.unit||'';$('standardMsg').textContent=rec.calibrationSaved?'Padrão salvo e incluído na curva.':'Informe concentração/unidade e salve para incluir na curva.'}
   if(rec.classification==='sample'){
-    const rr=resultForSample(rec,resultChannel);$('sampleMetrics').innerHTML=rr.ok?[
-      ['Sinal médio',fmt(rr.sig.mean,3)],['Concentração média',`${fmt(rr.cs.mean,6)} ${rr.reg.unit}`],['Desvio padrão (DP)',`${fmt(rr.cs.sd,6)} ${rr.reg.unit}`],['CV',`${fmt(rr.cs.cv,2)} %`]
-    ].map(([k,v])=>`<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join(''):`<div class="note">${escapeHtml(rr.reg?.msg||'Não há calibração válida para este canal.')}</div>`;
-    $('resultMsg').textContent=rr.ok?'Resultado calculado individualmente para cada replicata e resumido pela média, DP e CV.':'';
+    const rr=resultForSample(rec,resultChannel);
+    const sigOnly=stat(peakSignals(rec,resultChannel));
+    $('sampleMetrics').innerHTML=rr.ok?[
+      ['Sinal médio',fmt(rr.sig.mean,3)],
+      ['DP do sinal',fmt(rr.sig.sd,3)],
+      ['CV do sinal',`${fmt(rr.sig.cv,2)} %`],
+      ['Concentração média',`${fmt(rr.cs.mean,6)} ${rr.reg.unit}`],
+      ['DP da concentração',`${fmt(rr.cs.sd,6)} ${rr.reg.unit}`],
+      ['CV da concentração',`${fmt(rr.cs.cv,2)} %`]
+    ].map(([k,v])=>`<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join(''):[
+      ['Sinal médio',fmt(sigOnly.mean,3)],
+      ['DP do sinal',fmt(sigOnly.sd,3)],
+      ['CV do sinal',`${fmt(sigOnly.cv,2)} %`]
+    ].map(([k,v])=>`<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')+`<div class="note" style="grid-column:1/-1">${escapeHtml(rr.reg?.msg||'Não há calibração válida para este canal.')}</div>`;
+    renderReplicateMetrics(rec,resultChannel,rr);
+    $('resultMsg').textContent=rr.ok?'DP do sinal calculado diretamente a partir dos picos; DP da concentração calculado após converter cada replicata pela equação de calibração.':'Os valores de sinal e seus desvios continuam disponíveis mesmo sem calibração válida.';
   }else if(rec.classification==='standard'){
     const s=stat(peakSignals(rec,resultChannel));
     $('sampleMetrics').innerHTML=[
       ['Sinal médio do padrão',fmt(s.mean,3)],
-      ['Desvio padrão (DP)',fmt(s.sd,3)],
-      ['CV',`${fmt(s.cv,2)} %`]
+      ['DP do sinal',fmt(s.sd,3)],
+      ['CV do sinal',`${fmt(s.cv,2)} %`],
+      ['n',String(s.n)]
     ].map(x=>`<div class="metric"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');
-    $('resultMsg').textContent='';
-  }else{$('sampleMetrics').innerHTML='<div class="note">Classifique o registro como Padrão ou Amostra para utilizá-lo analiticamente.</div>';$('resultMsg').textContent=''}
+    renderReplicateMetrics(rec,resultChannel,null);
+    $('resultMsg').textContent='DP calculado como desvio padrão amostral dos máximos das replicatas (divisor n−1).';
+  }else{
+    const s=stat(peakSignals(rec,resultChannel));
+    $('sampleMetrics').innerHTML=s.n?[
+      ['Sinal médio',fmt(s.mean,3)],['DP do sinal',fmt(s.sd,3)],['CV do sinal',`${fmt(s.cv,2)} %`],['n',String(s.n)]
+    ].map(x=>`<div class="metric"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join(''):'<div class="note">Classifique o registro como Padrão ou Amostra para utilizá-lo analiticamente.</div>';
+    renderReplicateMetrics(rec,resultChannel,null);
+    $('resultMsg').textContent=s.n?'Estatística descritiva dos máximos detectados. Classifique o registro para cálculo analítico.':'';
+  }
 }
 document.querySelectorAll('#resultChannelTabs button').forEach(b=>b.onclick=()=>{resultChannel=b.dataset.ch;renderResults()});
 $('saveStandard').onclick=()=>{
